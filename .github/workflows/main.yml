@@ -27,21 +27,60 @@ jobs:
         run: |
           set -euo pipefail
           archive="$(find . -type f -iname 'mahmoud-tunnel-0.9.37-source.zip' -print -quit)"
-          if [ -z "$archive" ]; then
-            echo "Project ZIP not found"
-            exit 1
-          fi
+          test -n "$archive" || { echo "Project ZIP not found"; exit 1; }
           mkdir extracted
           unzip -q "$archive" -d extracted
           project="$(find extracted -name settings.gradle.kts -printf '%h\n' | head -n1)"
           if [ -z "$project" ]; then
             project="$(find extracted -name settings.gradle -printf '%h\n' | head -n1)"
           fi
-          if [ -z "$project" ]; then
-            echo "Gradle project not found"
-            exit 1
-          fi
+          test -n "$project" || { echo "Gradle project not found"; exit 1; }
           echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
+
+      - name: Patch Java compile errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          gradle = Path("app/build.gradle.kts")
+          s = gradle.read_text()
+          if "buildConfig = true" not in s:
+              s = re.sub(r'(android\s*\{)', r'\1\n    buildFeatures { buildConfig = true }', s, count=1)
+          gradle.write_text(s)
+
+          java = Path("app/src/main/java/com/mahmoud/tunnel/TunnelVpnService.java")
+          s = java.read_text()
+          s = s.replace("BuildConfig.VERSION_CODE", "com.mahmoud.tunnel.BuildConfig.VERSION_CODE")
+          s = s.replace("BuildConfig.VERSION_NAME", "com.mahmoud.tunnel.BuildConfig.VERSION_NAME")
+
+          old = "new IpPrefix(prefix.address(), prefix.prefix())"
+          new = "new IpPrefix(parseRouteAddress(prefix.address()), prefix.prefix())"
+          if old in s:
+              s = s.replace(old, new)
+          elif new not in s:
+              raise SystemExit("IpPrefix expression not found; stopping safely")
+
+          if "parseRouteAddress(String address)" not in s:
+              pos = s.rfind("}")
+              if pos < 0:
+                  raise SystemExit("Class closing brace not found")
+              helper = """
+              private static java.net.InetAddress parseRouteAddress(String address) {
+                  try {
+                      return java.net.InetAddress.getByName(address);
+                  } catch (java.net.UnknownHostException e) {
+                      throw new IllegalArgumentException("Invalid route address: " + address, e);
+                  }
+              }
+          """
+              s = s[:pos] + helper + s[pos:]
+          java.write_text(s)
+          print("Compile patches applied")
+          PY
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -49,7 +88,7 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build APK
-        run: gradle --no-daemon :app:assembleDebug
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
         working-directory: ${{ env.PROJECT_DIR }}
 
       - name: Upload APK
